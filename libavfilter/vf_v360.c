@@ -36,12 +36,12 @@
 #include <math.h>
 
 #include "libavutil/avassert.h"
-#include "libavutil/mem.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "filters.h"
 #include "formats.h"
+#include "internal.h"
 #include "video.h"
 #include "v360.h"
 
@@ -85,8 +85,6 @@ static const AVOption v360_options[] = {
     {        "og", "orthographic",                               0, AV_OPT_TYPE_CONST,  {.i64=ORTHOGRAPHIC},    0,                   0, FLAGS, .unit = "in" },
     {"octahedron", "octahedron",                                 0, AV_OPT_TYPE_CONST,  {.i64=OCTAHEDRON},      0,                   0, FLAGS, .unit = "in" },
     {"cylindricalea", "cylindrical equal area",                  0, AV_OPT_TYPE_CONST,  {.i64=CYLINDRICALEA},   0,                   0, FLAGS, .unit = "in" },
-	{ "meike65",   "meike65 custom fisheye",					 0, AV_OPT_TYPE_CONST,  {.i64=MEIKE65}, 		0, 					 0, FLAGS, .unit = "in" },
-	{"arrpyramid", "arrpyramid 180 playback format",		 	 0, AV_OPT_TYPE_CONST,  {.i64=ARRPYRAMID},		0, 					 0, FLAGS, .unit = "in" },
     {    "output", "set output projection",            OFFSET(out), AV_OPT_TYPE_INT,    {.i64=CUBEMAP_3_2},     0,    NB_PROJECTIONS-1, FLAGS, .unit = "out" },
     {         "e", "equirectangular",                            0, AV_OPT_TYPE_CONST,  {.i64=EQUIRECTANGULAR}, 0,                   0, FLAGS, .unit = "out" },
     {  "equirect", "equirectangular",                            0, AV_OPT_TYPE_CONST,  {.i64=EQUIRECTANGULAR}, 0,                   0, FLAGS, .unit = "out" },
@@ -118,9 +116,7 @@ static const AVOption v360_options[] = {
     {        "og", "orthographic",                               0, AV_OPT_TYPE_CONST,  {.i64=ORTHOGRAPHIC},    0,                   0, FLAGS, .unit = "out" },
     {"octahedron", "octahedron",                                 0, AV_OPT_TYPE_CONST,  {.i64=OCTAHEDRON},      0,                   0, FLAGS, .unit = "out" },
     {"cylindricalea", "cylindrical equal area",                  0, AV_OPT_TYPE_CONST,  {.i64=CYLINDRICALEA},   0,                   0, FLAGS, .unit = "out" },
-    { "meike65",   "meike65 custom fisheye",					 0, AV_OPT_TYPE_CONST,  {.i64=MEIKE65}, 		0, 					 0, FLAGS, .unit = "out" },
-	{"arrpyramid", "arrpyramid 180 playback format",		 	 0, AV_OPT_TYPE_CONST,  {.i64=ARRPYRAMID},		0, 					 0, FLAGS, .unit = "out" },
-	{    "interp", "set interpolation method",      OFFSET(interp), AV_OPT_TYPE_INT,    {.i64=BILINEAR},        0, NB_INTERP_METHODS-1, FLAGS, .unit = "interp" },
+    {    "interp", "set interpolation method",      OFFSET(interp), AV_OPT_TYPE_INT,    {.i64=BILINEAR},        0, NB_INTERP_METHODS-1, FLAGS, .unit = "interp" },
     {      "near", "nearest neighbour",                          0, AV_OPT_TYPE_CONST,  {.i64=NEAREST},         0,                   0, FLAGS, .unit = "interp" },
     {   "nearest", "nearest neighbour",                          0, AV_OPT_TYPE_CONST,  {.i64=NEAREST},         0,                   0, FLAGS, .unit = "interp" },
     {      "line", "bilinear interpolation",                     0, AV_OPT_TYPE_CONST,  {.i64=BILINEAR},        0,                   0, FLAGS, .unit = "interp" },
@@ -176,11 +172,9 @@ static const AVOption v360_options[] = {
 
 AVFILTER_DEFINE_CLASS(v360);
 
-static int query_formats(const AVFilterContext *ctx,
-                         AVFilterFormatsConfig **cfg_in,
-                         AVFilterFormatsConfig **cfg_out)
+static int query_formats(AVFilterContext *ctx)
 {
-    const V360Context *s = ctx->priv;
+    V360Context *s = ctx->priv;
     static const enum AVPixelFormat pix_fmts[] = {
         // YUVA444
         AV_PIX_FMT_YUVA444P,   AV_PIX_FMT_YUVA444P9,
@@ -256,8 +250,7 @@ static int query_formats(const AVFilterContext *ctx,
         AV_PIX_FMT_NONE
     };
 
-    return ff_set_common_formats_from_list2(ctx, cfg_in, cfg_out,
-                                            s->alpha ? alpha_pix_fmts : pix_fmts);
+    return ff_set_common_formats_from_list(ctx, s->alpha ? alpha_pix_fmts : pix_fmts);
 }
 
 #define DEFINE_REMAP1_LINE(bits, div)                                                    \
@@ -292,8 +285,6 @@ static int remap##ws##_##bits##bit_slice(AVFilterContext *ctx, void *arg, int jo
     const SliceXYRemap *r = &s->slice_remap[jobnr];                                                        \
     const AVFrame *in = td->in;                                                                            \
     AVFrame *out = td->out;                                                                                \
-                                                                                                           \
-    av_assert1(s->nb_planes <= AV_VIDEO_MAX_PLANES);                                                       \
                                                                                                            \
     for (int stereo = 0; stereo < 1 + s->out_stereo > STEREO_2D; stereo++) {                               \
         for (int plane = 0; plane < s->nb_planes; plane++) {                                               \
@@ -448,48 +439,6 @@ static void bilinear_kernel(float du, float dv, const XYRemap *rmap,
     ker[2] = lrintf((1.f - du) *        dv  * 16385.f);
     ker[3] = lrintf(       du  *        dv  * 16385.f);
 }
-
-/*------------------------------------------------------------------------------
- * Polynomial approximations for Meike 6.5 mm fisheye (no table lookup)
- *
- *   θ(ro)  ≈ π·[0.978·ro – 0.149·ro² + 0.215·ro³ – 0.098·ro⁴ + 0.020·ro⁵]
- *   ro(θ)  ≈ 1.024·ri – 0.360·ri² + 0.498·ri³ – 0.209·ri⁴ + 0.046·ri⁵
- *   where ri = θ/π
- *----------------------------------------------------------------------------*/
-static inline float v360_meike65_ro2theta(float ro) {
-    // Ro → θ: map observed radius to angle
-    const float r2 = ro * ro;
-    const float r3 = r2 * ro;
-    const float r4 = r2 * r2;
-    const float r5 = r4 * ro;
-	const float r6 = r3 * r3;
-	
-    // Originally Ri = … now θ = π/2 * Ri
-    const float ri = 0.677f * ro
-					+ 0.945f * r2
-					- 4.71f * r3
-					+ 11.f * r4
-					- 11.5f * r5
-					+ 4.57f * r6;
-    return M_PI_2 * ri;
-}
-
-static inline float v360_meike65_theta2ro(float theta) {
-    // θ → Ro: map angle to expected radius
-    const float ri = theta / M_PI_2;
-    const float r2 = ri * ri;
-    const float r3 = r2 * ri;
-    const float r4 = r2 * r2;
-    const float r5 = r4 * ri;
-	const float r6 = r3 * r3;
-    return 1.34f * ri
-         + 0.0896f * r2
-         - 0.642f * r3
-         + 0.506f * r4
-		 - 0.461f * r5
-         + 0.173f * r6;
-}
-
 
 /**
  * Calculate 1-dimensional lagrange coefficients.
@@ -1877,42 +1826,6 @@ static int hequirect_to_xyz(const V360Context *s,
 }
 
 /**
- * Calculate 3D coordinates on sphere for corresponding frame position in proprietary arr pyramid format.
- *
- * @param s filter private context
- * @param i horizontal position on frame [0, width)
- * @param j vertical position on frame [0, height)
- * @param width frame width
- * @param height frame height
- * @param vec coordinates on sphere
- */
-static int arrpyramid_to_xyz(const V360Context *s,
-                            int i, int j, int width, int height,
-                            float *vec)
-{
-	
-    const float p = rescale(i, width);
-    const float q = rescale(j, height);
-	
-	const float x = (p - q)/(2.f);
-	const float y = (p + q)/(2.f);
-	
-	const float phi = x * M_PI_2 / (1 - fabsf(y));
-	const float theta = y * M_PI_2;
-
-    const float sin_phi   = sinf(phi);
-    const float cos_phi   = cosf(phi);
-    const float sin_theta = sinf(theta);
-    const float cos_theta = cosf(theta);
-
-    vec[0] = cos_theta * sin_phi;
-    vec[1] = sin_theta;
-    vec[2] = cos_theta * cos_phi;
-
-    return 1;
-}
-
-/**
  * Prepare data for processing stereographic output format.
  *
  * @param ctx filter context
@@ -2310,52 +2223,6 @@ static int xyz_to_hequirect(const V360Context *s,
 
     const float uf = scale(phi, width);
     const float vf = scale(theta, height);
-
-    const int ui = floorf(uf);
-    const int vi = floorf(vf);
-
-    const int visible = phi >= -M_PI_2 && phi <= M_PI_2;
-
-    *du = uf - ui;
-    *dv = vf - vi;
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            us[i][j] = av_clip(ui + j - 1, 0, width  - 1);
-            vs[i][j] = av_clip(vi + i - 1, 0, height - 1);
-        }
-    }
-
-    return visible;
-}
-
-/**
- * Calculate frame position in arrpyramid format for corresponding 3D coordinates on sphere.
- *
- * @param s filter private context
- * @param vec coordinates on sphere
- * @param width frame width
- * @param height frame height
- * @param us horizontal coordinates for interpolation window
- * @param vs vertical coordinates for interpolation window
- * @param du horizontal relative coordinate
- * @param dv vertical relative coordinate
- */
-static int xyz_to_arrpyramid(const V360Context *s,
-                            const float *vec, int width, int height,
-                            int16_t us[4][4], int16_t vs[4][4], float *du, float *dv)
-{
-    const float phi   = atan2f(vec[0], vec[2]) / M_PI_2;
-    const float theta = asinf(vec[1]) / M_PI_2;
-	
-	const float y = theta;
-	const float x = phi * (1 - fabsf(y));
-	
-	const float p = (x + y);
-	const float q = (y - x);
-
-    const float uf = scale(p, width);
-    const float vf = scale(q, height);
 
     const int ui = floorf(uf);
     const int vi = floorf(vf);
@@ -3033,38 +2900,6 @@ static int fisheye_to_xyz(const V360Context *s,
 }
 
 /**
- * meike65_to_xyz
- *  Convert pixel (i,j) in a Meike 6.5 mm fisheye into a unit‐sphere vec.
- */
-static int meike65_to_xyz(const V360Context *s,
-                          int i, int j, int width, int height,
-                          float *vec)
-{
-    // 1) pixel → normalized plane coords [-1..+1]
-    const float uf_n = rescale(i, width);
-    const float vf_n = rescale(j, height);
-
-    // 2) radius in plane
-    const float r_norm = hypotf(uf_n, vf_n);
-
-    // 3) incident angle θ via your polynomial
-    const float theta = v360_meike65_ro2theta(r_norm);
-
-    // 4) to unit‐sphere vector
-    const float sin_t = sinf(theta);
-    if (r_norm > 0.f) {
-        vec[0] = sin_t * ( uf_n / r_norm);
-        vec[1] = sin_t * ( vf_n / r_norm);
-    } else {
-        vec[0] = vec[1] = 0.f;
-    }
-    vec[2] = cosf(theta);
-    return 1;
-}
-
-
-
-/**
  * Prepare data for processing fisheye input format.
  *
  * @param ctx filter context
@@ -3125,63 +2960,6 @@ static int xyz_to_fisheye(const V360Context *s,
 
     return visible;
 }
-
-/**
- * xyz_to_meike65
- *  Unit‐sphere vector → pixel coords & interpolation window in Meike 6.5 mm fisheye
- */
-static int xyz_to_meike65(const V360Context *s,
-                          const float *vec,
-                          int width, int height,
-                          int16_t us[4][4],
-                          int16_t vs[4][4],
-                          float *du, float *dv)
-{
-    // 1) Cartesian → spherical (θ, φ)
-    const float x     = vec[0];
-    const float y     = vec[1];
-    const float z     = vec[2];
-    const float theta = acosf(z);
-    const float phi   = atan2f(y, x);
-
-    // 2) normalized radius via your polynomial
-    const float r_norm = v360_meike65_theta2ro(theta);
-
-    // 3) map back to normalized plane coords [-1..+1]
-    const float uf_n = cosf(phi) * r_norm;
-    const float vf_n = sinf(phi) * r_norm;
-
-    // 4) visibility check
-    const int visible = (uf_n >= -1.f && uf_n <= 1.f &&
-                         vf_n >= -1.f && vf_n <= 1.f);
-
-    // 5) normalized → pixel coords
-    const float uf = scale(uf_n, width);
-    const float vf = scale(vf_n, height);
-
-    // 6) integer + fractional parts
-    const int ui = floorf(uf);
-    const int vi = floorf(vf);
-	
-    *du = visible ? uf - ui : 0.f;
-    *dv = visible ? vf - vi : 0.f;
-
-    // 7) build 4×4 clamped window
-    for (int m = 0; m < 4; m++) {
-        for (int n = 0; n < 4; n++) {
-            if (visible) {
-                us[m][n] = av_clip(ui + n - 1, 0, width  - 1);
-                vs[m][n] = av_clip(vi + m - 1, 0, height - 1);
-            } else {
-                us[m][n] = vs[m][n] = 0;
-            }
-        }
-    }
-
-    return visible;
-}
-
-
 
 /**
  * Calculate 3D coordinates on sphere for corresponding frame position in pannini format.
@@ -4666,9 +4444,6 @@ static int config_output(AVFilterLink *outlink)
     case FISHEYE:
         default_ih_fov = 180.f;
         default_iv_fov = 180.f;
-	case MEIKE65:
-        default_ih_fov = 180.f;
-        default_iv_fov = 180.f;
     default:
         break;
     }
@@ -4773,12 +4548,6 @@ static int config_output(AVFilterLink *outlink)
         wf = w * 2;
         hf = h;
         break;
-    case MEIKE65:
-        s->in_transform = xyz_to_meike65;
-        err = 0;
-        wf = w * 2;
-        hf = h;
-        break;
     case PANNINI:
         s->in_transform = xyz_to_pannini;
         err = 0;
@@ -4817,12 +4586,6 @@ static int config_output(AVFilterLink *outlink)
         break;
     case HEQUIRECTANGULAR:
         s->in_transform = xyz_to_hequirect;
-        err = 0;
-        wf = w * 2.f;
-        hf = h;
-        break;
-	case ARRPYRAMID:
-        s->in_transform = xyz_to_arrpyramid;
         err = 0;
         wf = w * 2.f;
         hf = h;
@@ -4939,12 +4702,6 @@ static int config_output(AVFilterLink *outlink)
         w = lrintf(wf * 0.5f);
         h = lrintf(hf);
         break;
-	case MEIKE65:
-        s->out_transform = meike65_to_xyz;
-        prepare_out = NULL;
-        w = lrintf(wf * 0.5f);
-        h = lrintf(hf);
-        break;	
     case PANNINI:
         s->out_transform = pannini_to_xyz;
         prepare_out = NULL;
@@ -4989,12 +4746,6 @@ static int config_output(AVFilterLink *outlink)
         break;
     case HEQUIRECTANGULAR:
         s->out_transform = hequirect_to_xyz;
-        prepare_out = NULL;
-        w = lrintf(wf / 2.f);
-        h = lrintf(hf);
-        break;
-	case ARRPYRAMID:
-        s->out_transform = arrpyramid_to_xyz;
         prepare_out = NULL;
         w = lrintf(wf / 2.f);
         h = lrintf(hf);
@@ -5059,10 +4810,6 @@ static int config_output(AVFilterLink *outlink)
     case STEREOGRAPHIC:
     case DUAL_FISHEYE:
     case FISHEYE:
-        default_h_fov = 180.f;
-        default_v_fov = 180.f;
-        break;
-	case MEIKE65:
         default_h_fov = 180.f;
         default_v_fov = 180.f;
         break;
@@ -5243,16 +4990,16 @@ static const AVFilterPad outputs[] = {
     },
 };
 
-const FFFilter ff_vf_v360 = {
-    .p.name        = "v360",
-    .p.description = NULL_IF_CONFIG_SMALL("Convert 360 projection of video."),
-    .p.priv_class  = &v360_class,
-    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
+const AVFilter ff_vf_v360 = {
+    .name          = "v360",
+    .description   = NULL_IF_CONFIG_SMALL("Convert 360 projection of video."),
     .priv_size     = sizeof(V360Context),
     .init          = init,
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(outputs),
-    FILTER_QUERY_FUNC2(query_formats),
+    FILTER_QUERY_FUNC(query_formats),
+    .priv_class    = &v360_class,
+    .flags         = AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };
