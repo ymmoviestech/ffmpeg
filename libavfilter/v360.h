@@ -56,6 +56,8 @@ enum Projections {
     OCTAHEDRON,
     CYLINDRICALEA,
     NB_PROJECTIONS,
+	MEIKE65,
+	ARRPYRAMID,
 };
 
 enum InterpMethod {
