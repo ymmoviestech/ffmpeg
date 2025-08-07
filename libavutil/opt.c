@@ -195,7 +195,7 @@ static int write_number(void *obj, const AVOption *o, void *dst, double num, int
     if (type != AV_OPT_TYPE_FLAGS &&
         (!den || o->max * den < num * intnum || o->min * den > num * intnum)) {
         num = den ? num * intnum / den : (num && intnum ? INFINITY : NAN);
-        av_log(obj, AV_LOG_ERROR, "Value %f for parameter '%s' out of range [%g - %g]\n",
+        av_log(obj, AV_LOG_ERROR, "198 Value %f for parameter '%s' out of range [%g - %g]\n",
                num, o->name, o->min, o->max);
         return AVERROR(ERANGE);
     }
@@ -632,7 +632,7 @@ static int opt_set_elem(void *obj, void *target_obj, const AVOption *o,
                 }
             }
             if (usecs < o->min || usecs > o->max) {
-                av_log(obj, AV_LOG_ERROR, "Value %f for parameter '%s' out of range [%g - %g]\n",
+                av_log(obj, AV_LOG_ERROR, "635 Value %f for parameter '%s' out of range [%g - %g]\n",
                        usecs / 1000000.0, o->name, o->min / 1000000.0, o->max / 1000000.0);
                 return AVERROR(ERANGE);
             }
